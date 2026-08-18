@@ -33,33 +33,32 @@ def render_video(req: RenderRequest):
             f.write(r_audio.content)
 
         # 2. โหลดรูปภาพ
+        headers = {'User-Agent': 'Mozilla/5.0'}
         for idx, url in enumerate(req.image_urls):
             img_path = f"img_{task_id}_{idx}.jpg"
-            r_img = requests.get(url, timeout=60)
+            r_img = requests.get(url, headers=headers, timeout=60)
             with open(img_path, "wb") as f:
                 f.write(r_img.content)
             img_files.append(img_path)
 
-        # 3. เรนเดอร์ทีละคลิปสั้นๆ เพื่อประหยัด RAM (ใช้ RAM ไม่เกิน 150MB)
+        # 3. เรนเดอร์รวดเร็วพิเศษ (ใช้ RAM ต่ำ + Fast Encoding)
         concat_list_file = f"concat_{task_id}.txt"
         with open(concat_list_file, "w") as f_list:
             for idx, img in enumerate(img_files):
                 clip_path = f"clip_{task_id}_{idx}.mp4"
-                # ซูมเข้าและซูมออกสลับกัน
-                zoom_expr = "min(zoom+0.0015,1.15)" if idx % 2 == 0 else "if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0015))"
                 
                 cmd_clip = [
                     "ffmpeg", "-y",
                     "-loop", "1", "-t", "8", "-i", img,
-                    "-filter_complex", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='{zoom_expr}':d=200:s=1080x1920:fps=25",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
                     clip_path
                 ]
                 subprocess.run(cmd_clip, check=True)
                 clip_files.append(clip_path)
                 f_list.write(f"file '{clip_path}'\n")
 
-        # 4. รวมคลิปและใส่เสียงธรรมะ
+        # 4. ประกอบเสียงและตัดจบตามความยาวเสียงจริง
         cmd_final = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_list_file,
@@ -71,14 +70,13 @@ def render_video(req: RenderRequest):
 
         return {
             "status": "success",
-            "video_url": f"/outputs/final_{task_id}.mp4"
+            "video_url": f"https://dharma-video-engine.onrender.com/{output_file}"
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # เคลียร์ไฟล์ขยะทันทีเพื่อคืน RAM
         for temp_f in [audio_file, f"concat_{task_id}.txt"] + img_files + clip_files:
             if os.path.exists(temp_f):
                 os.remove(temp_f)
