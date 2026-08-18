@@ -24,6 +24,7 @@ def render_video(req: RenderRequest):
     audio_file = f"audio_{task_id}.mp3"
     output_file = f"outputs/final_{task_id}.mp4"
     img_files = []
+    clip_files = []
 
     try:
         # 1. โหลดไฟล์เสียง
@@ -31,7 +32,7 @@ def render_video(req: RenderRequest):
         with open(audio_file, "wb") as f:
             f.write(r_audio.content)
 
-        # 2. โหลดภาพ AI 5 ภาพ
+        # 2. โหลดรูปภาพ
         for idx, url in enumerate(req.image_urls):
             img_path = f"img_{task_id}_{idx}.jpg"
             r_img = requests.get(url, timeout=60)
@@ -39,27 +40,34 @@ def render_video(req: RenderRequest):
                 f.write(r_img.content)
             img_files.append(img_path)
 
-        # 3. FFmpeg Ken Burns Effect สลับซูมเข้า/ออก 5 ฉาก 9:16 ความคมชัดสูง
-        cmd = [
+        # 3. เรนเดอร์ทีละคลิปสั้นๆ เพื่อประหยัด RAM (ใช้ RAM ไม่เกิน 150MB)
+        concat_list_file = f"concat_{task_id}.txt"
+        with open(concat_list_file, "w") as f_list:
+            for idx, img in enumerate(img_files):
+                clip_path = f"clip_{task_id}_{idx}.mp4"
+                # ซูมเข้าและซูมออกสลับกัน
+                zoom_expr = "min(zoom+0.0015,1.15)" if idx % 2 == 0 else "if(lte(zoom,1.0),1.15,max(1.0,zoom-0.0015))"
+                
+                cmd_clip = [
+                    "ffmpeg", "-y",
+                    "-loop", "1", "-t", "8", "-i", img,
+                    "-filter_complex", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='{zoom_expr}':d=200:s=1080x1920:fps=25",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    clip_path
+                ]
+                subprocess.run(cmd_clip, check=True)
+                clip_files.append(clip_path)
+                f_list.write(f"file '{clip_path}'\n")
+
+        # 4. รวมคลิปและใส่เสียงธรรมะ
+        cmd_final = [
             "ffmpeg", "-y",
-            "-loop", "1", "-t", "10", "-i", img_files[0],
-            "-loop", "1", "-t", "10", "-i", img_files[1],
-            "-loop", "1", "-t", "10", "-i", img_files[2],
-            "-loop", "1", "-t", "10", "-i", img_files[3],
-            "-loop", "1", "-t", "10", "-i", img_files[4],
+            "-f", "concat", "-safe", "0", "-i", concat_list_file,
             "-i", audio_file,
-            "-filter_complex",
-            "[0:v]zoompan=z='min(zoom+0.0015,1.2)':d=300:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920[v0];"
-            "[1:v]zoompan=z='if(lte(zoom,1.0),1.2,max(1.0,zoom-0.0015))':d=300:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920[v1];"
-            "[2:v]zoompan=z='min(zoom+0.0015,1.2)':d=300:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920[v2];"
-            "[3:v]zoompan=z='if(lte(zoom,1.0),1.2,max(1.0,zoom-0.0015))':d=300:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920[v3];"
-            "[4:v]zoompan=z='min(zoom+0.0015,1.2)':d=300:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920[v4];"
-            "[v0][v1][v2][v3][v4]concat=n=5:v=1:a=0[v_out]",
-            "-map", "[v_out]", "-map", "5:a",
-            "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p",
+            "-c:v", "copy", "-c:a", "aac",
             "-shortest", output_file
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd_final, check=True)
 
         return {
             "status": "success",
@@ -70,8 +78,7 @@ def render_video(req: RenderRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if os.path.exists(audio_file):
-            os.remove(audio_file)
-        for f in img_files:
-            if os.path.exists(f):
-                os.remove(f)
+        # เคลียร์ไฟล์ขยะทันทีเพื่อคืน RAM
+        for temp_f in [audio_file, f"concat_{task_id}.txt"] + img_files + clip_files:
+            if os.path.exists(temp_f):
+                os.remove(temp_f)
