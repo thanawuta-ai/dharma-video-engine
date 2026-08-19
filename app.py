@@ -14,36 +14,65 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
 FONT_DIR = os.path.join(BASE_DIR, "fonts")
+AUDIO_DIR = os.path.join(BASE_DIR, "assets")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(FONT_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# 1. ดาวน์โหลดฟอนต์ภาษาไทยมาตรฐานอัตโนมัติ (แก้ปัญหาลายน้ำ/ซับไตเติลภาษาต่างด้าว)
-FONT_PATH = os.path.join(FONT_DIR, "THSarabunNew.ttf")
-def ensure_thai_font():
+FONT_PATH = os.path.join(FONT_DIR, "Sarabun-Bold.ttf")
+BGM_PATH = os.path.join(AUDIO_DIR, "meditation_bgm.mp3")
+
+# 1. ดาวน์โหลดฟอนต์ภาษาไทย และเพลงบรรเลงธรรมะคลอเบาๆ
+def ensure_assets():
     if not os.path.exists(FONT_PATH):
-        font_url = "https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf"
         try:
-            r = requests.get(font_url, timeout=30)
+            r = requests.get("https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf", timeout=30)
             if r.status_code == 200:
                 with open(FONT_PATH, "wb") as f:
                     f.write(r.content)
         except Exception as e:
-            print(f"Font download error: {e}")
+            print(f"Font Error: {e}")
 
-ensure_thai_font()
+    if not os.path.exists(BGM_PATH):
+        try:
+            # เพลงบรรเลงเปียโน+ธรรมชาติ สงบนุ่มนวล (Royalty Free)
+            r = requests.get("https://cdn.pixabay.com/download/audio/2022/05/16/audio_c89b022b7a.mp3?filename=meditation-piano-9679.mp3", timeout=30)
+            if r.status_code == 200:
+                with open(BGM_PATH, "wb") as f:
+                    f.write(r.content)
+        except Exception as e:
+            print(f"BGM Error: {e}")
 
-# 2. ฟังก์ชันเสียงพากย์ไทยนุ่มนวล
+ensure_assets()
+
+# 2. ฟังก์ชันสร้างเสียงพากย์
 async def generate_voice(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-5%", pitch="-1Hz")
     await communicate.save(output_path)
     return output_path
 
-# 3. ฟังก์ชันดึงภาพแยก Seed ทุกฉาก (ป้องกันภาพซ้ำ)
+# 3. เจนภาพพระและธรรมะสวยงาม คมชัด ไม่หลุดธีม
 async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
-    aspect_hint = "vertical portrait 9:16" if height > width else "widescreen horizontal 16:9"
-    enhanced_prompt = f"{prompt}, tranquil Buddhist scene, cinematic soft lighting, masterpiece, 8k --no text, watermark"
+    aspect_hint = "vertical 9:16 portrait" if height > width else "horizontal 16:9 widescreen"
+    # เสริมคีย์เวิร์ดบังคับให้ได้ภาพพระ วัด และบรรยากาศธรรมะที่งดงาม
+    enhanced_prompt = f"Buddhism dharma art, {prompt}, serene Buddhist monastery, golden aura, peaceful monk or Buddha, cinematic lighting, 8k masterpiece, photorealistic --no modern buildings, cars, distorted, watermark, text"
     
+    # ดึงภาพจาก FLUX คุณภาพสูงโดยตรง
+    try:
+        encoded_prompt = urllib.parse.quote(enhanced_prompt)
+        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={5550 + (idx * 211)}"
+        async with session.get(pollinations_url, timeout=aiohttp.ClientTimeout(total=40)) as response:
+            if response.status == 200:
+                content = await response.read()
+                if len(content) > 10000:
+                    with open(filepath, "wb") as f:
+                        f.write(content)
+                    return filepath
+    except Exception as e:
+        print(f"Flux Error scene {idx+1}: {e}")
+
+    # สำรองผ่าน Hugging Face
     endpoints = [
         "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
         "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
@@ -60,20 +89,8 @@ async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
                         with open(filepath, "wb") as f:
                             f.write(content)
                         return filepath
-        except Exception as e:
-            print(f"HF Scene {idx+1} Warning: {e}")
-
-    # Fallback คุณภาพสูง พร้อม Random Seed ให้แต่ละภาพไม่ซ้ำกันเด็ดขาด
-    try:
-        encoded_prompt = urllib.parse.quote(f"peaceful Buddhist scene, {prompt}, masterpiece, 8k")
-        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={9100 + (idx * 137)}"
-        async with session.get(backup_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-            if response.status == 200:
-                with open(filepath, "wb") as f:
-                    f.write(await response.read())
-                return filepath
-    except Exception as e:
-        print(f"Backup Error scene {idx+1}: {e}")
+        except Exception:
+            pass
 
     return None
 
@@ -84,10 +101,7 @@ async def generate_all_images(prompts, job_id, hf_token, width, height):
             img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx:02d}.jpg")
             tasks.append(fetch_image(session, prompt, img_path, hf_token, idx, width, height))
         results = await asyncio.gather(*tasks)
-    
-    # เรียงลำดับไฟล์ภาพตามฉาก 0 ถึง N
-    valid_images = [r for r in sorted(results, key=lambda x: str(x)) if r and os.path.exists(r)]
-    return valid_images
+    return [r for r in sorted(results, key=lambda x: str(x)) if r and os.path.exists(r)]
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -100,11 +114,11 @@ def get_audio_duration(audio_path):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "healthy", "service": "Unified Dharma Video Engine"}), 200
+    return jsonify({"status": "healthy", "service": "Dharma Video Engine with BGM & Subs"}), 200
 
 @app.route("/render", methods=["POST"])
 def render_video():
-    ensure_thai_font()
+    ensure_assets()
     data = request.get_json(force=True)
     prompts = data.get("prompts", [])
     hf_token = data.get("hf_token", "")
@@ -115,14 +129,20 @@ def render_video():
 
     if mode == "short":
         width, height = 1080, 1920
+        font_size_wm = 50
+        font_size_sub = 44
+        y_sub = 1400  # วางซับไตเติลให้อยู่กึ่งกลางล่างระดับสายตา
     else:
         width, height = 1920, 1080
+        font_size_wm = 44
+        font_size_sub = 40
+        y_sub = 900
 
-    if not prompts or not hf_token or not story_script:
-        return jsonify({"error": "prompts, hf_token, and story_script are required"}), 400
+    if not prompts or not story_script:
+        return jsonify({"error": "prompts and story_script are required"}), 400
 
     job_id = str(uuid.uuid4())[:8]
-    audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
+    voice_audio_path = os.path.join(TEMP_DIR, f"{job_id}_voice.mp3")
     final_video_name = f"video_{job_id}.mp4"
     final_video_path = os.path.join(OUTPUT_DIR, final_video_name)
 
@@ -130,20 +150,20 @@ def render_video():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # 1. สร้างเสียงพากย์
-        loop.run_until_complete(generate_voice(story_script, voice, audio_path))
-        audio_duration = get_audio_duration(audio_path)
+        # 1. สร้างเสียงคนพากย์
+        loop.run_until_complete(generate_voice(story_script, voice, voice_audio_path))
+        voice_duration = get_audio_duration(voice_audio_path)
 
-        # 2. สร้างภาพทุกฉาก
+        # 2. เจนภาพพระ/ธรรมะแยกฉาก
         image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token, width, height))
         loop.close()
 
         if len(image_files) == 0:
             return jsonify({"error": "Failed to generate images"}), 500
 
-        duration_per_image = max(audio_duration / len(image_files), 2.0)
+        duration_per_image = max(voice_duration / len(image_files), 2.0)
 
-        # 3. สร้าง Concat List สำหรับภาพสลับฉาก
+        # 3. ไฟล์ Concat สำหรับเปลี่ยนรูปภาพตามจังหวะ
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
@@ -151,25 +171,54 @@ def render_video():
                 f.write(f"duration {duration_per_image:.2f}\n")
             f.write(f"file '{image_files[-1]}'\n")
 
-        # 4. Filter FFmpeg: แสดงผลภาษาไทยผ่านฟอนต์ Sarabun + จัดตำแหน่งลายน้ำ
+        # 4. เตรียมข้อความซับไตเติลภาษาไทย (ตัดบรรทัดให้อ่านง่าย)
+        clean_sub_text = story_script.replace("'", "").replace('"', '').replace("\n", " ")
+        # ย่อข้อความให้แสดงผลเป็นท่อนๆ หรือแสดงสรุปข้อคิด
+        if len(clean_sub_text) > 120:
+            clean_sub_text = clean_sub_text[:115] + "..."
+
         font_arg = f":fontfile='{FONT_PATH}'" if os.path.exists(FONT_PATH) else ""
+
+        # 5. รวม Video Filter (ภาพ + ลายน้ำบน + ซับไตเติลล่าง)
         vf_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            f"drawtext=text='{watermark_text}'{font_arg}:fontcolor=white:fontsize=52:box=1:boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=140,"
+            # ลายน้ำบน
+            f"drawtext=text='{watermark_text}'{font_arg}:fontcolor=yellow@0.9:fontsize={font_size_wm}:box=1:boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=120,"
+            # คำบรรยายซับไตเติลล่าง
+            f"drawtext=text='{clean_sub_text}'{font_arg}:fontcolor=white:fontsize={font_size_sub}:box=1:boxcolor=black@0.6:boxborderw=15:x=(w-text_w)/2:y={y_sub},"
             f"format=yuv420p"
         )
 
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_file,
-            "-i", audio_path,
-            "-vf", vf_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            "-movflags", "+faststart",
-            final_video_path
-        ]
+        # 6. ประกอบเสียงพากย์ + เพลงบรรเลงคลอเบาๆ (-20dB)
+        if os.path.exists(BGM_PATH):
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_file,
+                "-i", voice_audio_path,
+                "-stream_loop", "-1", "-i", BGM_PATH,
+                "-filter_complex",
+                f"[0:v]{vf_filter}[v];[2:a]volume=0.18[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]",
+                "-map", "[v]",
+                "-map", "[a]",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                "-movflags", "+faststart",
+                final_video_path
+            ]
+        else:
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_file,
+                "-i", voice_audio_path,
+                "-vf", vf_filter,
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                "-movflags", "+faststart",
+                final_video_path
+            ]
+
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         video_url = f"https://{request.host}/outputs/{final_video_name}"
@@ -177,7 +226,7 @@ def render_video():
             "status": "success",
             "mode": mode,
             "video_url": video_url,
-            "duration_seconds": audio_duration,
+            "duration_seconds": voice_duration,
             "images_rendered": len(image_files)
         }), 200
 
