@@ -5,3 +5,7 @@ python-multipart
 flask
 aiohttp
 gunicorn
+flask
+aiohttp
+edge-tts
+urllib3
