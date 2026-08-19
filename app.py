@@ -18,20 +18,18 @@ async def download_image(session, url, filepath):
     """ดาวน์โหลดภาพแบบ Asynchronous พร้อม Timeout 25 วินาที"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        clean_url = str(url).strip()
-        async with session.get(clean_url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as response:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as response:
             if response.status == 200:
                 with open(filepath, "wb") as f:
                     f.write(await response.read())
                 return filepath
-            else:
-                print(f"Image download status {response.status} for: {clean_url}")
     except Exception as e:
-        print(f"Failed to download image {url}: {e}")
+        print(f"Failed to download {url}: {e}")
     return None
 
 async def download_all_images(image_urls, job_id):
     """ดาวน์โหลดทุกภาพพร้อมกันแบบคู่ขนาน (Parallel)"""
+    image_files = []
     async with aiohttp.ClientSession() as session:
         tasks = []
         for idx, url in enumerate(image_urls):
@@ -59,14 +57,11 @@ def index():
 @app.route("/render", methods=["POST"])
 def render_video():
     data = request.get_json(force=True)
-    raw_audio_url = data.get("audio_url")
+    audio_url = data.get("audio_url")
     image_urls = data.get("image_urls", [])
 
-    if not raw_audio_url or not image_urls:
+    if not audio_url or not image_urls:
         return jsonify({"error": "audio_url and image_urls are required"}), 400
-
-    # ตัดช่องว่างหน้า-หลัง URL อัตโนมัติป้องกัน 500 error
-    audio_url = str(raw_audio_url).strip()
 
     job_id = str(uuid.uuid4())[:8]
     audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
@@ -75,9 +70,8 @@ def render_video():
 
     try:
         # 1. ดาวน์โหลดไฟล์เสียง
-        print(f"[{job_id}] Downloading audio from: {audio_url}")
+        print(f"[{job_id}] Downloading audio...")
         audio_res = requests.get(audio_url, timeout=30)
-        audio_res.raise_for_status()
         with open(audio_path, "wb") as f:
             f.write(audio_res.content)
 
@@ -94,20 +88,19 @@ def render_video():
         if not image_files:
             return jsonify({"error": "Failed to download any images"}), 500
 
-        print(f"[{job_id}] Successfully downloaded {len(image_files)} images.")
-
         # คำนวณเวลาแสดงผลต่อภาพ
         duration_per_image = max(audio_duration / len(image_files), 1.0)
 
-        # 3. สร้างไฟล์ Concat สำหรับ FFmpeg (Low RAM)
+        # 3. สร้างไฟล์รายการ Concat สำหรับ FFmpeg (Low RAM)
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
                 f.write(f"file '{img}'\n")
                 f.write(f"duration {duration_per_image:.2f}\n")
+            # FFmpeg Concat Demuxer ต้องใส่ภาพสุดท้ายซ้ำอีกรอบ
             f.write(f"file '{image_files[-1]}'\n")
 
-        # 4. รวมไฟล์ด้วย FFmpeg (Ultra-Fast & Low Memory)
+        # 4. รวมภาพกับเสียงด้วย FFmpeg (Ultra-Fast Preset & Low Memory)
         print(f"[{job_id}] Rendering video via FFmpeg...")
         ffmpeg_cmd = [
             "ffmpeg", "-y",
