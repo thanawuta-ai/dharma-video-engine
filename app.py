@@ -15,24 +15,34 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 async def generate_image_hf(session, prompt, filepath, hf_token):
-    """สั่งเจนภาพจาก Hugging Face (FLUX.1-schnell)"""
-    url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
-    headers = {"Authorization": f"Bearer {hf_token}"}
+    """เจนภาพผ่าน Hugging Face พร้อมระบบรอคิวและโมเดลสำรอง"""
+    models = [
+        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+        "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    ]
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "x-wait-for-model": "true"
+    }
     payload = {"inputs": prompt}
-    try:
-        async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-            if response.status == 200:
-                with open(filepath, "wb") as f:
-                    f.write(await response.read())
-                return filepath
-            else:
-                print(f"HF Error {response.status}: {await response.text()}")
-    except Exception as e:
-        print(f"Failed to generate HF image: {e}")
+
+    for url in models:
+        for attempt in range(2):
+            try:
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        with open(filepath, "wb") as f:
+                            f.write(content)
+                        return filepath
+                    else:
+                        print(f"HF {url} attempt {attempt+1} error {response.status}: {await response.text()}")
+            except Exception as e:
+                print(f"HF request failed: {e}")
+            await asyncio.sleep(2)
     return None
 
 async def generate_all_images(prompts, job_id, hf_token):
-    """รันคำสั่งเจนภาพทีละรูป (หน่วงเวลา 1.5 วิ ป้องกัน Rate Limit โควตาฟรี)"""
     image_files = []
     async with aiohttp.ClientSession() as session:
         for idx, prompt in enumerate(prompts):
@@ -40,7 +50,7 @@ async def generate_all_images(prompts, job_id, hf_token):
             res = await generate_image_hf(session, prompt, img_path, hf_token)
             if res and os.path.exists(res):
                 image_files.append(res)
-            await asyncio.sleep(1.5) 
+            await asyncio.sleep(1.0)
     return image_files
 
 def get_audio_duration(audio_path):
@@ -72,14 +82,14 @@ def render_video():
     final_video_path = os.path.join(OUTPUT_DIR, final_video_name)
 
     try:
-        # 1. โหลดเสียง
+        # 1. ดาวน์โหลดไฟล์เสียง
         audio_res = requests.get(audio_url, timeout=30)
         audio_res.raise_for_status()
         with open(audio_path, "wb") as f:
             f.write(audio_res.content)
         audio_duration = get_audio_duration(audio_path)
 
-        # 2. เจนภาพด้วย Hugging Face
+        # 2. เจนภาพจาก Hugging Face
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token))
@@ -90,7 +100,7 @@ def render_video():
 
         duration_per_image = max(audio_duration / len(image_files), 1.0)
 
-        # 3. จัดการ FFmpeg (Render Video)
+        # 3. เรนเดอร์ด้วย FFmpeg
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
