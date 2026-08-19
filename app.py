@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import requests
 import subprocess
+import textwrap
 import edge_tts
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -21,23 +22,23 @@ os.makedirs(FONT_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
 FONT_PATH = os.path.join(FONT_DIR, "Sarabun-Bold.ttf")
-BGM_PATH = os.path.join(AUDIO_DIR, "meditation_bgm.mp3")
+BGM_PATH = os.path.join(AUDIO_DIR, "dharma_bgm.mp3")
 
-# 1. ดาวน์โหลดฟอนต์ภาษาไทย และเพลงบรรเลงธรรมะคลอเบาๆ
 def ensure_assets():
+    # 1. โหลดฟอนต์ Sarabun
     if not os.path.exists(FONT_PATH):
         try:
-            r = requests.get("https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf", timeout=30)
+            r = requests.get("https://raw.githubusercontent.com/google/fonts/main/ofl/sarabun/Sarabun-Bold.ttf", timeout=30)
             if r.status_code == 200:
                 with open(FONT_PATH, "wb") as f:
                     f.write(r.content)
         except Exception as e:
             print(f"Font Error: {e}")
 
+    # 2. โหลดเพลงบรรเลงธรรมะ/สมาธิสงบๆ (คลอเบาๆ)
     if not os.path.exists(BGM_PATH):
         try:
-            # เพลงบรรเลงเปียโน+ธรรมชาติ สงบนุ่มนวล (Royalty Free)
-            r = requests.get("https://cdn.pixabay.com/download/audio/2022/05/16/audio_c89b022b7a.mp3?filename=meditation-piano-9679.mp3", timeout=30)
+            r = requests.get("https://actions.google.com/sounds/v1/ambiences/outdoor_water_spring.ogg", timeout=30)
             if r.status_code == 200:
                 with open(BGM_PATH, "wb") as f:
                     f.write(r.content)
@@ -46,23 +47,32 @@ def ensure_assets():
 
 ensure_assets()
 
-# 2. ฟังก์ชันสร้างเสียงพากย์
+# 1. ฟังก์ชันสร้างเสียงพากย์นุ่มนวล
 async def generate_voice(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-5%", pitch="-1Hz")
     await communicate.save(output_path)
     return output_path
 
-# 3. เจนภาพพระและธรรมะสวยงาม คมชัด ไม่หลุดธีม
-async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
+# 2. บังคับเจนภาพพระพุทธรูป พระสงฆ์ และวัดป่าที่สวยงาม คมชัด 4K
+async def fetch_image(session, user_prompt, filepath, hf_token, idx, width, height):
     aspect_hint = "vertical 9:16 portrait" if height > width else "horizontal 16:9 widescreen"
-    # เสริมคีย์เวิร์ดบังคับให้ได้ภาพพระ วัด และบรรยากาศธรรมะที่งดงาม
-    enhanced_prompt = f"Buddhism dharma art, {prompt}, serene Buddhist monastery, golden aura, peaceful monk or Buddha, cinematic lighting, 8k masterpiece, photorealistic --no modern buildings, cars, distorted, watermark, text"
     
-    # ดึงภาพจาก FLUX คุณภาพสูงโดยตรง
+    # ธีมภาพธรรมะ 5 แบบ บังคับให้แต่ละฉากได้ภาพไม่ซ้ำกัน
+    dharma_themes = [
+        "majestic golden Buddha statue in peaceful meditation, rainforest, morning golden sunlight rays, spiritual aura, highly detailed, photorealistic 8k",
+        "serene elderly Thai Buddhist monk in saffron robe walking in ancient bamboo forest garden, soft warm sunset light, realistic, 8k",
+        "beautiful ancient golden Buddhist temple on a mountain top surrounded by sea of morning mist, breathtaking landscape, 8k",
+        "close up of radiant lotus flower blooming on serene temple pond, golden water reflection, tranquility, 8k",
+        "peaceful Buddha statue in sacred wooden temple, warm oil lamps glowing softly, atmospheric and peaceful, 8k"
+    ]
+    theme_prompt = dharma_themes[idx % len(dharma_themes)]
+    final_prompt = f"{theme_prompt}, {user_prompt} --no text, modern, distorted, watermark"
+
+    # ดึงภาพจาก FLUX คุณภาพสูง
     try:
-        encoded_prompt = urllib.parse.quote(enhanced_prompt)
-        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={5550 + (idx * 211)}"
-        async with session.get(pollinations_url, timeout=aiohttp.ClientTimeout(total=40)) as response:
+        encoded_prompt = urllib.parse.quote(final_prompt)
+        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={12000 + (idx * 337)}"
+        async with session.get(pollinations_url, timeout=aiohttp.ClientTimeout(total=45)) as response:
             if response.status == 200:
                 content = await response.read()
                 if len(content) > 10000:
@@ -78,7 +88,7 @@ async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
         "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
     ]
     headers = {"Authorization": f"Bearer {hf_token}", "x-wait-for-model": "true"}
-    payload = {"inputs": f"{enhanced_prompt}, {aspect_hint}"}
+    payload = {"inputs": f"{final_prompt}, {aspect_hint}"}
 
     for url in endpoints:
         try:
@@ -97,7 +107,8 @@ async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
 async def generate_all_images(prompts, job_id, hf_token, width, height):
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for idx, prompt in enumerate(prompts):
+        for idx in range(len(prompts)):
+            prompt = prompts[idx] if idx < len(prompts) else f"Scene {idx+1}"
             img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx:02d}.jpg")
             tasks.append(fetch_image(session, prompt, img_path, hf_token, idx, width, height))
         results = await asyncio.gather(*tasks)
@@ -114,7 +125,7 @@ def get_audio_duration(audio_path):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "healthy", "service": "Dharma Video Engine with BGM & Subs"}), 200
+    return jsonify({"status": "healthy", "service": "Unified Dharma Video Engine"}), 200
 
 @app.route("/render", methods=["POST"])
 def render_video():
@@ -127,19 +138,19 @@ def render_video():
     story_script = data.get("story_script")
     voice = data.get("voice", "th-TH-PremwadeeNeural")
 
-    if mode == "short":
-        width, height = 1080, 1920
-        font_size_wm = 50
-        font_size_sub = 44
-        y_sub = 1400  # วางซับไตเติลให้อยู่กึ่งกลางล่างระดับสายตา
-    else:
-        width, height = 1920, 1080
-        font_size_wm = 44
-        font_size_sub = 40
-        y_sub = 900
-
     if not prompts or not story_script:
         return jsonify({"error": "prompts and story_script are required"}), 400
+
+    if mode == "short":
+        width, height = 1080, 1920
+        font_size_wm = 42
+        font_size_sub = 32  # ปรับลดขนาดตัวหนังสือให้อ่านง่าย สบายตา ไม่บังภาพ
+        y_sub = 1500
+    else:
+        width, height = 1920, 1080
+        font_size_wm = 36
+        font_size_sub = 28
+        y_sub = 920
 
     job_id = str(uuid.uuid4())[:8]
     voice_audio_path = os.path.join(TEMP_DIR, f"{job_id}_voice.mp3")
@@ -150,11 +161,11 @@ def render_video():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # 1. สร้างเสียงคนพากย์
+        # 1. เสียงพากย์
         loop.run_until_complete(generate_voice(story_script, voice, voice_audio_path))
         voice_duration = get_audio_duration(voice_audio_path)
 
-        # 2. เจนภาพพระ/ธรรมะแยกฉาก
+        # 2. รูปภาพพระ/ธรรมะ 5 ฉากไม่ซ้ำกัน
         image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token, width, height))
         loop.close()
 
@@ -163,7 +174,7 @@ def render_video():
 
         duration_per_image = max(voice_duration / len(image_files), 2.0)
 
-        # 3. ไฟล์ Concat สำหรับเปลี่ยนรูปภาพตามจังหวะ
+        # 3. Concat List สำหรับสลับภาพ
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
@@ -171,25 +182,27 @@ def render_video():
                 f.write(f"duration {duration_per_image:.2f}\n")
             f.write(f"file '{image_files[-1]}'\n")
 
-        # 4. เตรียมข้อความซับไตเติลภาษาไทย (ตัดบรรทัดให้อ่านง่าย)
-        clean_sub_text = story_script.replace("'", "").replace('"', '').replace("\n", " ")
-        # ย่อข้อความให้แสดงผลเป็นท่อนๆ หรือแสดงสรุปข้อคิด
-        if len(clean_sub_text) > 120:
-            clean_sub_text = clean_sub_text[:115] + "..."
+        # 4. จัดการคำบรรยายซับไตเติลภาษาไทย: ตัดข้อความให้อ่านง่าย ไม่เกิน 2 บรรทัด
+        clean_text = story_script.replace("'", "").replace('"', '').replace("\n", " ")
+        wrapped_lines = textwrap.wrap(clean_text, width=32)
+        display_sub = "\n".join(wrapped_lines[:2])
+        if len(wrapped_lines) > 2:
+            display_sub += "..."
+
+        sub_file = os.path.join(TEMP_DIR, f"{job_id}_sub.txt")
+        with open(sub_file, "w", encoding="utf-8") as f:
+            f.write(display_sub)
 
         font_arg = f":fontfile='{FONT_PATH}'" if os.path.exists(FONT_PATH) else ""
 
-        # 5. รวม Video Filter (ภาพ + ลายน้ำบน + ซับไตเติลล่าง)
+        # 5. FFmpeg Filters: ลายน้ำ + ซับไตเติลขนาดกำลังดี + เพลงบรรเลง
         vf_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            # ลายน้ำบน
-            f"drawtext=text='{watermark_text}'{font_arg}:fontcolor=yellow@0.9:fontsize={font_size_wm}:box=1:boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=120,"
-            # คำบรรยายซับไตเติลล่าง
-            f"drawtext=text='{clean_sub_text}'{font_arg}:fontcolor=white:fontsize={font_size_sub}:box=1:boxcolor=black@0.6:boxborderw=15:x=(w-text_w)/2:y={y_sub},"
+            f"drawtext=text='{watermark_text}'{font_arg}:fontcolor=yellow:fontsize={font_size_wm}:box=1:boxcolor=black@0.4:boxborderw=10:x=(w-text_w)/2:y=130,"
+            f"drawtext=textfile='{sub_file}'{font_arg}:fontcolor=white:fontsize={font_size_sub}:line_spacing=12:box=1:boxcolor=black@0.6:boxborderw=14:x=(w-text_w)/2:y={y_sub},"
             f"format=yuv420p"
         )
 
-        # 6. ประกอบเสียงพากย์ + เพลงบรรเลงคลอเบาๆ (-20dB)
         if os.path.exists(BGM_PATH):
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
@@ -197,7 +210,7 @@ def render_video():
                 "-i", voice_audio_path,
                 "-stream_loop", "-1", "-i", BGM_PATH,
                 "-filter_complex",
-                f"[0:v]{vf_filter}[v];[2:a]volume=0.18[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]",
+                f"[0:v]{vf_filter}[v];[2:a]volume=0.15[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]",
                 "-map", "[v]",
                 "-map", "[a]",
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
