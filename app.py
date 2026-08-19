@@ -34,13 +34,11 @@ def ensure_font():
 
 ensure_font()
 
-# ปรับเสียงพากย์ช้าลง นุ่มนวลฟังสบาย
 async def generate_voice(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-10%", pitch="-1Hz")
     await communicate.save(output_path)
     return output_path
 
-# ฟังก์ชันดึงภาพธรรมะ FLUX 5 สไตล์ไม่ซ้ำกัน
 async def fetch_image(session, user_prompt, filepath, idx, width, height):
     dharma_masterpieces = [
         "Magnificent glowing golden Buddha statue meditating under ancient Bodhi tree, divine morning sun rays, lush rainforest, photorealistic 8k, masterpiece",
@@ -55,8 +53,7 @@ async def fetch_image(session, user_prompt, filepath, idx, width, height):
     full_prompt = f"{theme}, {clean_user} --no text, ugly, distorted, watermark"
     encoded = urllib.parse.quote(full_prompt)
     
-    # ดึงภาพจาก FLUX Engine แยก Seed ป้องกันภาพซ้ำ
-    polli_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&model=flux&nologo=true&seed={60000 + (idx * 521)}"
+    polli_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&model=flux&nologo=true&seed={70000 + (idx * 617)}"
     try:
         async with session.get(polli_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status == 200:
@@ -67,7 +64,14 @@ async def fetch_image(session, user_prompt, filepath, idx, width, height):
                     return filepath
     except Exception:
         pass
-    return None
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", f"color=c=black:s={width}x{height}:d=1",
+        "-vframes", "1", filepath
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return filepath
 
 async def generate_all_images(prompts, job_id, width, height):
     async with aiohttp.ClientSession() as session:
@@ -88,7 +92,6 @@ def get_audio_duration(audio_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return float(result.stdout.strip())
 
-# วาดตัวหนังสือภาษาไทยลงบนแต่ละภาพ
 def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, width, height):
     img = Image.open(img_path).convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(img)
@@ -103,7 +106,6 @@ def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, wid
         font_wm = ImageFont.load_default()
         font_sub = ImageFont.load_default()
 
-    # ลายน้ำบน
     wm_bbox = draw.textbbox((0, 0), watermark_text, font=font_wm)
     wm_w = wm_bbox[2] - wm_bbox[0]
     wm_h = wm_bbox[3] - wm_bbox[1]
@@ -114,7 +116,6 @@ def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, wid
     draw.rounded_rectangle([wm_x - pad, wm_y - pad, wm_x + wm_w + pad, wm_y + wm_h + pad], radius=10, fill=(0, 0, 0, 160))
     draw.text((wm_x, wm_y), watermark_text, font=font_wm, fill=(255, 215, 0, 255))
 
-    # ซับไตเติลล่าง
     if subtitle_text:
         wrapped_lines = textwrap.wrap(subtitle_text, width=26)
         full_sub_text = "\n".join(wrapped_lines[:2])
@@ -161,26 +162,21 @@ def render_video():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # 1. เจนเสียงพากย์
         loop.run_until_complete(generate_voice(story_script, voice, voice_audio_path))
         voice_duration = get_audio_duration(voice_audio_path)
 
-        # 2. เจนภาพ FLUX
         raw_images = loop.run_until_complete(generate_all_images(prompts, job_id, width, height))
         loop.close()
 
         if len(raw_images) == 0:
             return jsonify({"error": "Failed to generate images"}), 500
 
-        # คำนวณเวลาต่อภาพให้ยาวเต็มความยาวของเสียงพากย์จริง
         duration_per_image = max(voice_duration / len(raw_images), 2.0)
 
-        # 3. ตัดแบ่งประโยคข้อความ
         sentences = [s.strip() for s in story_script.replace("...", ",").replace(";", ",").replace(".", ",").split(",") if s.strip()]
         if not sentences:
             sentences = [story_script]
 
-        # 4. วาดตัวหนังสือลงบนภาพทุกรูป
         ready_images = []
         for i, raw_img in enumerate(raw_images):
             out_img = os.path.join(TEMP_DIR, f"{job_id}_ready_{i:02d}.jpg")
@@ -188,7 +184,6 @@ def render_video():
             burn_text_on_image(raw_img, watermark_text, scene_sub, out_img, width, height)
             ready_images.append(out_img)
 
-        # 5. สร้าง Concat List ที่แท้จริง (สลับภาพครบทุกรูปตามเวลา)
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in ready_images:
@@ -196,7 +191,6 @@ def render_video():
                 f.write(f"duration {duration_per_image:.2f}\n")
             f.write(f"file '{ready_images[-1]}'\n")
 
-        # 6. ตัดต่อด้วย FFmpeg ให้เล่นเต็มเวลาของเสียงพากย์
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
