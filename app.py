@@ -16,40 +16,43 @@ TEMP_DIR = os.path.join(BASE_DIR, "temp")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# 1. ฟังก์ชันสร้างเสียงพากย์ฟรีด้วย Edge-TTS
+# 1. ปรับแต่งเสียงพากย์ให้นุ่มนวล สงบ และช้าลง เหมาะกับการเล่าเรื่องธรรมะ
 async def generate_voice(text, voice_name, output_path):
-    communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="+0%", pitch="+0Hz")
+    # ปรับ rate ให้ช้าลง 10% และ pitch -2Hz ให้นุ่มทุ้มฟังสบาย
+    communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-10%", pitch="-2Hz")
     await communicate.save(output_path)
     return output_path
 
-# 2. ฟังก์ชันดาวน์โหลด/เจนภาพ FLUX 
+# 2. ฟังก์ชันเจนภาพ FLUX แบบล็อกสไตล์ คมชัด 4K ไม่มีตัวหนังสือ
 async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
     aspect_hint = "portrait 9:16 vertical" if height > width else "widescreen 16:9 horizontal"
+    # เสริม Quality Prompt อัตโนมัติ ป้องกันภาพเละและตัดตัวหนังสือทิ้ง
+    enhanced_prompt = f"{prompt}, tranquil Buddhist atmosphere, cinematic warm lighting, masterpiece, photorealistic, 8k, detailed Asian landscape, smooth digital painting --no text, blurry, watermark, words"
+    
     endpoints = [
         "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
         "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
         "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
     ]
     headers = {"Authorization": f"Bearer {hf_token}", "x-wait-for-model": "true"}
-    payload = {"inputs": f"{prompt}, {aspect_hint}, cinematic masterpiece, highly detailed, 4k"}
+    payload = {"inputs": f"{enhanced_prompt}, {aspect_hint}"}
 
-    # ลำดับที่ 1: เจนผ่าน Hugging Face Router
     for url in endpoints:
         try:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=45)) as response:
                 if response.status == 200:
                     content = await response.read()
-                    if len(content) > 5000:
+                    if len(content) > 10000:
                         with open(filepath, "wb") as f:
                             f.write(content)
                         return filepath
         except Exception as e:
-            print(f"HF Scene {idx+1} Warning: {e}")
+            print(f"HF Error Scene {idx+1}: {e}")
 
-    # ลำดับที่ 2: ระบบสำรองอัตโนมัติ ป้องกันเซิร์ฟเวอร์ค้าง
+    # Fallback คุณภาพสูง พร้อม Random Seed ให้ภาพไม่ซ้ำกัน
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={6000 + idx}"
+        encoded_prompt = urllib.parse.quote(f"peaceful Buddhist dharma scene, {prompt}, masterpiece, 8k, no text")
+        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={7000 + idx * 37}"
         async with session.get(backup_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status == 200:
                 with open(filepath, "wb") as f:
@@ -80,14 +83,14 @@ def get_audio_duration(audio_path):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "healthy", "service": "Unified Video Rendering Engine"}), 200
+    return jsonify({"status": "healthy", "service": "Dharma Storytelling Engine"}), 200
 
 @app.route("/render", methods=["POST"])
 def render_video():
     data = request.get_json(force=True)
     prompts = data.get("prompts", [])
     hf_token = data.get("hf_token", "")
-    mode = data.get("mode", "short")  # ค่า "short" = 9:16 แนวตั้ง | "long" = 16:9 แนวนอน
+    mode = data.get("mode", "long")
     
     if mode == "short":
         width, height = 1080, 1920
@@ -112,7 +115,7 @@ def render_video():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # จัดการเสียงพากย์
+        # 1. สร้างเสียงพากย์นุ่มสงบ
         if story_script:
             loop.run_until_complete(generate_voice(story_script, voice, audio_path))
         elif audio_url:
@@ -123,16 +126,16 @@ def render_video():
 
         audio_duration = get_audio_duration(audio_path)
 
-        # จัดการรูปภาพ
+        # 2. สร้างภาพ 16:9 แบบ Full HD
         image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token, width, height))
         loop.close()
 
         if len(image_files) == 0:
             return jsonify({"error": "Failed to generate images"}), 500
 
-        duration_per_image = max(audio_duration / len(image_files), 1.0)
+        duration_per_image = max(audio_duration / len(image_files), 2.0)
 
-        # ตัดต่อด้วย FFmpeg
+        # 3. ตัดต่อ FFmpeg
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
