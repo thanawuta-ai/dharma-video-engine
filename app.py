@@ -15,12 +15,12 @@ TEMP_DIR = os.path.join(BASE_DIR, "temp")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-async def generate_image_hf(session, prompt, filepath, hf_token, idx):
-    """ดึงภาพผ่าน Hugging Face Router API / SDXL / Fallback"""
+async def fetch_single_image(session, prompt, filepath, hf_token, idx):
+    """ดึงภาพ 1 รูป โดยมี fallback หากโมเดลหลักติดคิว"""
     endpoints = [
-        f"https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
-        f"https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
-        f"https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
+        "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+        "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
     ]
     headers = {
         "Authorization": f"Bearer {hf_token}",
@@ -28,43 +28,42 @@ async def generate_image_hf(session, prompt, filepath, hf_token, idx):
     }
     payload = {"inputs": prompt}
 
-    # 1. พยายามเรียกผ่าน Hugging Face
+    # 1. ลอง Hugging Face
     for url in endpoints:
         try:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=45)) as response:
                 if response.status == 200:
                     content = await response.read()
-                    if len(content) > 5000:  # มั่นใจว่าเป็นไฟล์รูปจริง
+                    if len(content) > 5000:
                         with open(filepath, "wb") as f:
                             f.write(content)
                         return filepath
         except Exception as e:
-            print(f"HF Error on {url}: {e}")
+            print(f"HF Error on scene {idx+1}: {e}")
 
-    # 2. แผนสำรอง: ถ้า HF ติดคิว ให้ใช้ FLUX Engine สำรองทันที งานจะไม่ล่ม
+    # 2. Fallback ทันทีถ้า HF ไม่ตอบสนอง
     try:
         encoded_prompt = urllib.parse.quote(prompt)
-        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&nologo=true&model=flux&seed={1000 + idx}"
+        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&nologo=true&model=flux&seed={2000 + idx}"
         async with session.get(backup_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status == 200:
                 with open(filepath, "wb") as f:
                     f.write(await response.read())
                 return filepath
     except Exception as e:
-        print(f"Backup Error: {e}")
+        print(f"Backup Error on scene {idx+1}: {e}")
 
     return None
 
 async def generate_all_images(prompts, job_id, hf_token):
-    image_files = []
+    """ยิงเจนภาพพร้อมกัน 5 รูป (Parallel) เพื่อความรวดเร็วและได้ครบทุกฉาก"""
     async with aiohttp.ClientSession() as session:
+        tasks = []
         for idx, prompt in enumerate(prompts):
             img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx}.jpg")
-            res = await generate_image_hf(session, prompt, img_path, hf_token, idx)
-            if res and os.path.exists(res):
-                image_files.append(res)
-            await asyncio.sleep(0.5)
-    return image_files
+            tasks.append(fetch_single_image(session, prompt, img_path, hf_token, idx))
+        results = await asyncio.gather(*tasks)
+    return [r for r in results if r and os.path.exists(r)]
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -113,7 +112,7 @@ def render_video():
 
         duration_per_image = max(audio_duration / len(image_files), 1.0)
 
-        # ตัดต่อวิดีโอ FFmpeg
+        # ตัดต่อ FFmpeg
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
@@ -135,8 +134,12 @@ def render_video():
         
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        video_url = f"{request.host_url.rstrip('/')}/outputs/{final_video_name}"
-        return jsonify({"status": "success", "video_url": video_url, "images_rendered": len(image_files)}), 200
+        video_url = f"https://{request.host}/outputs/{final_video_name}"
+        return jsonify({
+            "status": "success", 
+            "video_url": video_url, 
+            "images_rendered": len(image_files)
+        }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -150,7 +153,7 @@ def render_video():
 
 @app.route("/outputs/<path:filename>", methods=["GET"])
 def get_output(filename):
-    return send_from_directory(OUTPUT_DIR, filename)
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
