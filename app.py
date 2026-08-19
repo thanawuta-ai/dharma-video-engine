@@ -22,7 +22,6 @@ os.makedirs(FONT_DIR, exist_ok=True)
 
 FONT_PATH = os.path.join(FONT_DIR, "Sarabun-Bold.ttf")
 
-# 1. ดาวน์โหลดฟอนต์ Sarabun แท้ 100%
 def ensure_font():
     if not os.path.exists(FONT_PATH):
         try:
@@ -35,49 +34,73 @@ def ensure_font():
 
 ensure_font()
 
-# 2. ฟังก์ชันเสียงพากย์นุ่มนวล
 async def generate_voice(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-10%", pitch="-1Hz")
     await communicate.save(output_path)
     return output_path
 
-# 3. เจนภาพพระ/วัด/บรรยากาศธรรมะแท้ๆ
-async def fetch_image(session, prompt, filepath, idx, width, height):
-    dharma_themes = [
-        "majestic golden Buddha statue meditating in tranquil rainforest, morning golden sunbeams, spiritual aura, highly detailed, photorealistic 8k",
-        "Thai Buddhist monk in saffron robe walking in ancient bamboo forest path, warm sunset light, calm and serene, 8k",
-        "ancient golden Buddhist temple pagoda on mountain summit above white mist, dramatic sunrise sky, masterpiece 8k",
-        "sacred blooming pink lotus flower in temple pond, crystal water reflection, tranquility, 8k",
-        "peaceful golden Buddha face in serene wooden monastery, glowing oil lamps, atmospheric and peaceful, 8k"
-    ]
-    theme = dharma_themes[idx % len(dharma_themes)]
-    clean_prompt = urllib.parse.quote(f"{theme}, {prompt}")
+# ฟังก์ชันเจนภาพ FLUX พุทธศิลป์ สวย คมชัด อลังการ
+async def fetch_image(session, user_prompt, filepath, hf_token, idx, width, height):
+    aspect_ratio = "9:16" if height > width else "16:9"
     
-    urls = [
-        f"https://image.pollinations.ai/prompt/{clean_prompt}?width={width}&height={height}&nologo=true&seed={30000 + idx * 179}",
-        f"https://picsum.photos/{width}/{height}?random={idx + 100}"
+    # ธีมภาพพุทธศิลป์ 5 สไตล์ที่สร้างขึ้นมาอย่างประณีต
+    dharma_masterpieces = [
+        "Magnificent glowing golden Buddha statue meditating peacefully under ancient Bodhi tree, divine morning sun rays breaking through golden mist, lush jungle, ultra detailed, photorealistic 8k, cinematic lighting, masterpiece",
+        "Serene wise Thai Buddhist monk in saffron robe walking mindfully along a mystical bamboo forest path, warm golden hour sunlight, tranquil atmospheric depth, 8k",
+        "Ancient majestic Buddhist pagoda temple perched on high mountain peak above sea of white clouds, spectacular sunrise sky, spiritual aura, award winning photography, 8k",
+        "Close up shot of sacred glowing pink lotus blooming on crystal clear pond, golden water ripple reflections, tranquil zen meditation vibe, highly detailed 8k",
+        "Sacred ancient wooden Buddhist monastery hall, glowing candlelight illuminating tranquil Buddha face, spiritual atmosphere, masterpiece 8k"
     ]
+    
+    base_theme = dharma_masterpieces[idx % len(dharma_masterpieces)]
+    clean_user = user_prompt.replace('"', '').replace("'", "") if user_prompt else ""
+    full_prompt = f"{base_theme}, {clean_user}, masterpiece, highly detailed, photorealistic, 8k, cinematic composition --no modern, cars, text, ugly, blurry, watermark"
 
-    for url in urls:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    if len(content) > 5000:
-                        with open(filepath, "wb") as f:
-                            f.write(content)
-                        return filepath
-        except Exception:
-            continue
+    # ลำดับ 1: ดึงผ่าน Hugging Face FLUX.1
+    if hf_token:
+        hf_urls = [
+            "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+            "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+            "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
+        ]
+        headers = {"Authorization": f"Bearer {hf_token}", "x-wait-for-model": "true"}
+        payload = {"inputs": f"{full_prompt}, {aspect_ratio}"}
+
+        for url in hf_urls:
+            try:
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        if len(content) > 10000:
+                            with open(filepath, "wb") as f:
+                                f.write(content)
+                            return filepath
+            except Exception:
+                pass
+
+    # ลำดับ 2: Pollinations FLUX Engine (คมชัด สีสดสมจริง)
+    try:
+        encoded = urllib.parse.quote(full_prompt)
+        polli_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&model=flux&nologo=true&seed={50000 + idx * 313}"
+        async with session.get(polli_url, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                if len(content) > 10000:
+                    with open(filepath, "wb") as f:
+                        f.write(content)
+                    return filepath
+    except Exception:
+        pass
+
     return None
 
-async def generate_all_images(prompts, job_id, width, height):
+async def generate_all_images(prompts, job_id, hf_token, width, height):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for idx in range(len(prompts)):
             p = prompts[idx] if idx < len(prompts) else f"Scene {idx+1}"
             img_path = os.path.join(TEMP_DIR, f"{job_id}_raw_{idx:02d}.jpg")
-            tasks.append(fetch_image(session, p, img_path, idx, width, height))
+            tasks.append(fetch_image(session, p, img_path, hf_token, idx, width, height))
         results = await asyncio.gather(*tasks)
     return [r for r in sorted(results, key=lambda x: str(x)) if r and os.path.exists(r)]
 
@@ -90,13 +113,13 @@ def get_audio_duration(audio_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return float(result.stdout.strip())
 
-# 4. ฟังก์ชันวาดตัวหนังสือภาษาไทยด้วย Pillow (รองรับฟอนต์ไทย 100% สระไม่ลอย ไม่เป็นสี่เหลี่ยม)
+# วาดตัวหนังสือภาษาไทย คมชัด สระไม่ลอย
 def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, width, height):
     img = Image.open(img_path).convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(img)
 
     wm_size = 40 if height > width else 32
-    sub_size = 34 if height > width else 28
+    sub_size = 32 if height > width else 26
 
     try:
         font_wm = ImageFont.truetype(FONT_PATH, wm_size)
@@ -105,7 +128,7 @@ def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, wid
         font_wm = ImageFont.load_default()
         font_sub = ImageFont.load_default()
 
-    # 4.1 วาดลายน้ำด้านบน
+    # ลายน้ำบน
     wm_bbox = draw.textbbox((0, 0), watermark_text, font=font_wm)
     wm_w = wm_bbox[2] - wm_bbox[0]
     wm_h = wm_bbox[3] - wm_bbox[1]
@@ -113,22 +136,22 @@ def burn_text_on_image(img_path, watermark_text, subtitle_text, output_path, wid
     wm_y = 120 if height > width else 50
 
     pad = 12
-    draw.rounded_rectangle([wm_x - pad, wm_y - pad, wm_x + wm_w + pad, wm_y + wm_h + pad], radius=10, fill=(0, 0, 0, 140))
-    draw.text((wm_x, wm_y), watermark_text, font=font_wm, fill=(255, 220, 50, 255))
+    draw.rounded_rectangle([wm_x - pad, wm_y - pad, wm_x + wm_w + pad, wm_y + wm_h + pad], radius=10, fill=(0, 0, 0, 150))
+    draw.text((wm_x, wm_y), watermark_text, font=font_wm, fill=(255, 215, 0, 255))
 
-    # 4.2 วาดคำบรรยายด้านล่าง (ตัดบรรทัดให้อ่านง่าย สบายตา)
+    # ซับไตเติลล่าง
     if subtitle_text:
-        wrapped_lines = textwrap.wrap(subtitle_text, width=28)
+        wrapped_lines = textwrap.wrap(subtitle_text, width=26)
         full_sub_text = "\n".join(wrapped_lines[:2])
         
-        sub_bbox = draw.multiline_textbbox((0, 0), full_sub_text, font=font_sub, spacing=10)
+        sub_bbox = draw.multiline_textbbox((0, 0), full_sub_text, font=font_sub, spacing=8)
         sub_w = sub_bbox[2] - sub_bbox[0]
         sub_h = sub_bbox[3] - sub_bbox[1]
         sub_x = (width - sub_w) // 2
-        sub_y = height - sub_h - (220 if height > width else 80)
+        sub_y = height - sub_h - (240 if height > width else 80)
 
-        draw.rounded_rectangle([sub_x - 16, sub_y - 12, sub_x + sub_w + 16, sub_y + sub_h + 12], radius=12, fill=(0, 0, 0, 160))
-        draw.multiline_text((sub_x, sub_y), full_sub_text, font=font_sub, fill=(255, 255, 255, 255), align="center", spacing=10)
+        draw.rounded_rectangle([sub_x - 16, sub_y - 10, sub_x + sub_w + 16, sub_y + sub_h + 10], radius=12, fill=(0, 0, 0, 170))
+        draw.multiline_text((sub_x, sub_y), full_sub_text, font=font_sub, fill=(255, 255, 255, 255), align="center", spacing=8)
 
     img.convert("RGB").save(output_path, "JPEG", quality=95)
 
@@ -141,6 +164,7 @@ def render_video():
     ensure_font()
     data = request.get_json(force=True)
     prompts = data.get("prompts", [])
+    hf_token = data.get("hf_token", "")
     mode = data.get("mode", "short")
     watermark_text = data.get("watermark", "- บารมี พระใหม่ -")
     story_script = data.get("story_script")
@@ -167,21 +191,21 @@ def render_video():
         loop.run_until_complete(generate_voice(story_script, voice, voice_audio_path))
         voice_duration = get_audio_duration(voice_audio_path)
 
-        # 2. ดาวน์โหลดรูปภาพ
-        raw_images = loop.run_until_complete(generate_all_images(prompts, job_id, width, height))
+        # 2. สร้างภาพธรรมะคุณภาพสูงระดับ 8K
+        raw_images = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token, width, height))
         loop.close()
 
         if len(raw_images) == 0:
             return jsonify({"error": "Failed to generate images"}), 500
 
-        duration_per_image = max(voice_duration / len(raw_images), 1.5)
+        duration_per_image = max(voice_duration / len(raw_images), 2.0)
 
-        # 3. ตัดแบ่งประโยคคำบรรยายให้แต่ละฉาก
+        # 3. ตัดแบ่งประโยคคำบรรยาย
         sentences = [s.strip() for s in story_script.replace("...", ",").replace(";", ",").split(",") if s.strip()]
         if not sentences:
             sentences = [story_script]
 
-        # 4. วาดตัวหนังสือภาษาไทยลงในทุกรูปภาพ
+        # 4. วาดตัวหนังสือลงบนภาพ
         ready_images = []
         for i, raw_img in enumerate(raw_images):
             out_img = os.path.join(TEMP_DIR, f"{job_id}_ready_{i:02d}.jpg")
@@ -189,7 +213,7 @@ def render_video():
             burn_text_on_image(raw_img, watermark_text, scene_sub, out_img, width, height)
             ready_images.append(out_img)
 
-        # 5. ประกอบคลิปด้วย Concat
+        # 5. ประกอบคลิปพร้อมเอฟเฟกต์ซูมภาพอย่างนุ่มนวล (Ken Burns Zoom)
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in ready_images:
@@ -201,6 +225,7 @@ def render_video():
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
             "-i", voice_audio_path,
+            "-vf", "zoompan=z='min(zoom+0.0015,1.15)':d=125:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=720x1280:fps=25",
             "-pix_fmt", "yuv420p",
             "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac", "-b:a", "192k",
