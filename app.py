@@ -14,34 +14,36 @@ TEMP_DIR = os.path.join(BASE_DIR, "temp")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-async def download_image(session, url, filepath):
-    """ดาวน์โหลดภาพแบบ Asynchronous พร้อม Timeout 25 วินาที"""
-    headers = {"User-Agent": "Mozilla/5.0"}
+async def generate_image_hf(session, prompt, filepath, hf_token):
+    """สั่งเจนภาพจาก Hugging Face (FLUX.1-schnell)"""
+    url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {"inputs": prompt}
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as response:
+        async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
             if response.status == 200:
                 with open(filepath, "wb") as f:
                     f.write(await response.read())
                 return filepath
+            else:
+                print(f"HF Error {response.status}: {await response.text()}")
     except Exception as e:
-        print(f"Failed to download {url}: {e}")
+        print(f"Failed to generate HF image: {e}")
     return None
 
-async def download_all_images(image_urls, job_id):
-    """ดาวน์โหลดทุกภาพพร้อมกันแบบคู่ขนาน (Parallel)"""
+async def generate_all_images(prompts, job_id, hf_token):
+    """รันคำสั่งเจนภาพทีละรูป (หน่วงเวลา 1.5 วิ ป้องกัน Rate Limit โควตาฟรี)"""
     image_files = []
     async with aiohttp.ClientSession() as session:
-        tasks = []
-        for idx, url in enumerate(image_urls):
+        for idx, prompt in enumerate(prompts):
             img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx}.jpg")
-            tasks.append(download_image(session, url, img_path))
-        
-        results = await asyncio.gather(*tasks)
-        image_files = [res for res in results if res is not None and os.path.exists(res)]
+            res = await generate_image_hf(session, prompt, img_path, hf_token)
+            if res and os.path.exists(res):
+                image_files.append(res)
+            await asyncio.sleep(1.5) 
     return image_files
 
 def get_audio_duration(audio_path):
-    """ดึงความยาวของไฟล์เสียงด้วย ffprobe"""
     cmd = [
         "ffprobe", "-v", "error", "-show_entries",
         "format=duration", "-of",
@@ -52,16 +54,17 @@ def get_audio_duration(audio_path):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "healthy", "service": "dharma-video-engine"}), 200
+    return jsonify({"status": "healthy"}), 200
 
 @app.route("/render", methods=["POST"])
 def render_video():
     data = request.get_json(force=True)
-    audio_url = data.get("audio_url")
-    image_urls = data.get("image_urls", [])
+    audio_url = str(data.get("audio_url", "")).strip()
+    prompts = data.get("prompts", [])
+    hf_token = data.get("hf_token")
 
-    if not audio_url or not image_urls:
-        return jsonify({"error": "audio_url and image_urls are required"}), 400
+    if not audio_url or not prompts or not hf_token:
+        return jsonify({"error": "audio_url, prompts, and hf_token are required"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
@@ -69,39 +72,32 @@ def render_video():
     final_video_path = os.path.join(OUTPUT_DIR, final_video_name)
 
     try:
-        # 1. ดาวน์โหลดไฟล์เสียง
-        print(f"[{job_id}] Downloading audio...")
+        # 1. โหลดเสียง
         audio_res = requests.get(audio_url, timeout=30)
+        audio_res.raise_for_status()
         with open(audio_path, "wb") as f:
             f.write(audio_res.content)
-
         audio_duration = get_audio_duration(audio_path)
-        print(f"[{job_id}] Audio duration: {audio_duration:.2f}s")
 
-        # 2. ดาวน์โหลดรูปภาพทั้งหมดพร้อมกัน (Parallel)
-        print(f"[{job_id}] Downloading {len(image_urls)} images in parallel...")
+        # 2. เจนภาพด้วย Hugging Face
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        image_files = loop.run_until_complete(download_all_images(image_urls, job_id))
+        image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token))
         loop.close()
 
-        if not image_files:
-            return jsonify({"error": "Failed to download any images"}), 500
+        if len(image_files) == 0:
+            return jsonify({"error": "Hugging Face failed to generate images"}), 500
 
-        # คำนวณเวลาแสดงผลต่อภาพ
         duration_per_image = max(audio_duration / len(image_files), 1.0)
 
-        # 3. สร้างไฟล์รายการ Concat สำหรับ FFmpeg (Low RAM)
+        # 3. จัดการ FFmpeg (Render Video)
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
                 f.write(f"file '{img}'\n")
                 f.write(f"duration {duration_per_image:.2f}\n")
-            # FFmpeg Concat Demuxer ต้องใส่ภาพสุดท้ายซ้ำอีกรอบ
             f.write(f"file '{image_files[-1]}'\n")
 
-        # 4. รวมภาพกับเสียงด้วย FFmpeg (Ultra-Fast Preset & Low Memory)
-        print(f"[{job_id}] Rendering video via FFmpeg...")
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
@@ -117,20 +113,11 @@ def render_video():
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         video_url = f"{request.host_url.rstrip('/')}/outputs/{final_video_name}"
-        print(f"[{job_id}] Render completed successfully: {video_url}")
-
-        return jsonify({
-            "status": "success",
-            "video_url": video_url,
-            "duration": audio_duration
-        }), 200
+        return jsonify({"status": "success", "video_url": video_url, "images_rendered": len(image_files)}), 200
 
     except Exception as e:
-        print(f"[{job_id}] Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
     finally:
-        # เคลียร์ไฟล์ชั่วคราว
         for f in os.listdir(TEMP_DIR):
             if f.startswith(job_id):
                 try:
