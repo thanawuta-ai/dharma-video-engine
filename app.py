@@ -13,24 +13,40 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(FONT_DIR, exist_ok=True)
 
-# 1. ปรับเสียงพากย์ให้นุ่มนวล เป็นธรรมชาติ ชวนฟัง
+# 1. ดาวน์โหลดฟอนต์ภาษาไทยมาตรฐานอัตโนมัติ (แก้ปัญหาลายน้ำ/ซับไตเติลภาษาต่างด้าว)
+FONT_PATH = os.path.join(FONT_DIR, "THSarabunNew.ttf")
+def ensure_thai_font():
+    if not os.path.exists(FONT_PATH):
+        font_url = "https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf"
+        try:
+            r = requests.get(font_url, timeout=30)
+            if r.status_code == 200:
+                with open(FONT_PATH, "wb") as f:
+                    f.write(r.content)
+        except Exception as e:
+            print(f"Font download error: {e}")
+
+ensure_thai_font()
+
+# 2. ฟังก์ชันเสียงพากย์ไทยนุ่มนวล
 async def generate_voice(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text=text, voice=voice_name, rate="-5%", pitch="-1Hz")
     await communicate.save(output_path)
     return output_path
 
-# 2. ฟังก์ชันเจนภาพ FLUX คมชัดสมจริง
+# 3. ฟังก์ชันดึงภาพแยก Seed ทุกฉาก (ป้องกันภาพซ้ำ)
 async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
     aspect_hint = "vertical portrait 9:16" if height > width else "widescreen horizontal 16:9"
-    enhanced_prompt = f"{prompt}, tranquil Buddhist atmosphere, cinematic soft lighting, highly detailed masterpiece, 8k --no text, words, watermark"
+    enhanced_prompt = f"{prompt}, tranquil Buddhist scene, cinematic soft lighting, masterpiece, 8k --no text, watermark"
     
     endpoints = [
         "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
-        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
-        "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
+        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
     ]
     headers = {"Authorization": f"Bearer {hf_token}", "x-wait-for-model": "true"}
     payload = {"inputs": f"{enhanced_prompt}, {aspect_hint}"}
@@ -45,12 +61,12 @@ async def fetch_image(session, prompt, filepath, hf_token, idx, width, height):
                             f.write(content)
                         return filepath
         except Exception as e:
-            print(f"HF Error Scene {idx+1}: {e}")
+            print(f"HF Scene {idx+1} Warning: {e}")
 
-    # Fallback คุณภาพสูง
+    # Fallback คุณภาพสูง พร้อม Random Seed ให้แต่ละภาพไม่ซ้ำกันเด็ดขาด
     try:
-        encoded_prompt = urllib.parse.quote(f"peaceful Buddhist scene, {prompt}, masterpiece, 8k, no text")
-        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={8000 + idx * 43}"
+        encoded_prompt = urllib.parse.quote(f"peaceful Buddhist scene, {prompt}, masterpiece, 8k")
+        backup_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&model=flux&seed={9100 + (idx * 137)}"
         async with session.get(backup_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status == 200:
                 with open(filepath, "wb") as f:
@@ -65,10 +81,13 @@ async def generate_all_images(prompts, job_id, hf_token, width, height):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for idx, prompt in enumerate(prompts):
-            img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx}.jpg")
+            img_path = os.path.join(TEMP_DIR, f"{job_id}_img_{idx:02d}.jpg")
             tasks.append(fetch_image(session, prompt, img_path, hf_token, idx, width, height))
         results = await asyncio.gather(*tasks)
-    return [r for r in results if r and os.path.exists(r)]
+    
+    # เรียงลำดับไฟล์ภาพตามฉาก 0 ถึง N
+    valid_images = [r for r in sorted(results, key=lambda x: str(x)) if r and os.path.exists(r)]
+    return valid_images
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -85,25 +104,22 @@ def index():
 
 @app.route("/render", methods=["POST"])
 def render_video():
+    ensure_thai_font()
     data = request.get_json(force=True)
     prompts = data.get("prompts", [])
     hf_token = data.get("hf_token", "")
     mode = data.get("mode", "short")
     watermark_text = data.get("watermark", "- บารมี พระใหม่ -")
-    
+    story_script = data.get("story_script")
+    voice = data.get("voice", "th-TH-PremwadeeNeural")
+
     if mode == "short":
         width, height = 1080, 1920
     else:
         width, height = 1920, 1080
 
-    story_script = data.get("story_script")
-    audio_url = data.get("audio_url")
-    voice = data.get("voice", "th-TH-PremwadeeNeural")
-
-    if not prompts or not hf_token:
-        return jsonify({"error": "prompts and hf_token are required"}), 400
-    if not story_script and not audio_url:
-        return jsonify({"error": "Either story_script or audio_url is required"}), 400
+    if not prompts or not hf_token or not story_script:
+        return jsonify({"error": "prompts, hf_token, and story_script are required"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
@@ -114,27 +130,20 @@ def render_video():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # 1. เสียงพากย์
-        if story_script:
-            loop.run_until_complete(generate_voice(story_script, voice, audio_path))
-        elif audio_url:
-            res = requests.get(audio_url, timeout=30)
-            res.raise_for_status()
-            with open(audio_path, "wb") as f:
-                f.write(res.content)
-
+        # 1. สร้างเสียงพากย์
+        loop.run_until_complete(generate_voice(story_script, voice, audio_path))
         audio_duration = get_audio_duration(audio_path)
 
-        # 2. รูปภาพ
+        # 2. สร้างภาพทุกฉาก
         image_files = loop.run_until_complete(generate_all_images(prompts, job_id, hf_token, width, height))
         loop.close()
 
         if len(image_files) == 0:
             return jsonify({"error": "Failed to generate images"}), 500
 
-        duration_per_image = max(audio_duration / len(image_files), 1.5)
+        duration_per_image = max(audio_duration / len(image_files), 2.0)
 
-        # 3. สร้าง Concat List
+        # 3. สร้าง Concat List สำหรับภาพสลับฉาก
         concat_file = os.path.join(TEMP_DIR, f"{job_id}_concat.txt")
         with open(concat_file, "w") as f:
             for img in image_files:
@@ -142,10 +151,11 @@ def render_video():
                 f.write(f"duration {duration_per_image:.2f}\n")
             f.write(f"file '{image_files[-1]}'\n")
 
-        # 4. Filter FFmpeg: ปรับขนาด + ใส่ลายน้ำตรงกลางบน
+        # 4. Filter FFmpeg: แสดงผลภาษาไทยผ่านฟอนต์ Sarabun + จัดตำแหน่งลายน้ำ
+        font_arg = f":fontfile='{FONT_PATH}'" if os.path.exists(FONT_PATH) else ""
         vf_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            f"drawtext=text='{watermark_text}':fontcolor=white@0.85:fontsize=46:box=1:boxcolor=black@0.4:boxborderw=10:x=(w-text_w)/2:y=120,"
+            f"drawtext=text='{watermark_text}'{font_arg}:fontcolor=white:fontsize=52:box=1:boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=140,"
             f"format=yuv420p"
         )
 
